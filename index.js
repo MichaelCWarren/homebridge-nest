@@ -30,48 +30,62 @@ class NestPlatform {
         this.api = api;
         this.accessoryLookup = {};
         this.cachedAccessories = [];
+        this.claimedUUIDs = new Set();
+        this.excludedUUIDs = new Set();
 
         api.on('didFinishLaunching', async () => {
             this.log('Fetching Nest devices.');
 
-            const generateAccessories = function(data) {
-                const foundAccessories = [];
+            const deviceTypes = [ThermostatAccessory, HomeAwayAccessory, TempSensorAccessory, ProtectAccessory, LockAccessory];
+            const disableFlags = {
+                'thermostat': 'Thermostat.Disable',
+                'temp_sensor': 'TempSensor.Disable',
+                'protect': 'Protect.Disable',
+                'home_away_sensor': 'HomeAway.Disable',
+                'lock': 'Lock.Disable'
+            };
 
-                const loadDevices = function(DeviceType) {
-                    const disableFlags = {
-                        'thermostat': 'Thermostat.Disable',
-                        'temp_sensor': 'TempSensor.Disable',
-                        'protect': 'Protect.Disable',
-                        'home_away_sensor': 'HomeAway.Disable',
-                        'lock': 'Lock.Disable'
-                    };
-
+            // Returns the accessories for devices not yet mounted. Devices that are already mounted, or that the
+            // user excluded in config, are skipped.
+            const mountNewDevices = function(data) {
+                const mounted = [];
+                for (const DeviceType of deviceTypes) {
                     const devices = (data.devices && data.devices[DeviceType.deviceGroup]) || {};
                     for (const deviceId of Object.keys(devices)) {
-                        const device = devices[deviceId];
-                        const serialNumber = device.serial_number;
-                        if (!this.optionSet(disableFlags[DeviceType.deviceType], serialNumber, deviceId)) {
-                            const structureId = device.structure_id;
-                            if (this.config.structureId && this.config.structureId !== structureId) {
-                                this.log('Skipping device ' + deviceId + ' because it is not in the required structure. Has ' + structureId + ', looking for ' + this.config.structureId + '.');
-                                continue;
-                            }
-                            const structure = data.structures[structureId];
-                            const accessory = new DeviceType(this.conn, this.log, device, structure, this);
-                            this.accessoryLookup[deviceId] = accessory;
-                            foundAccessories.push(accessory);
+                        const uuid = this.accessoryUUID(DeviceType, deviceId);
+                        if (this.accessoryLookup[deviceId] || this.excludedUUIDs.has(uuid)) {
+                            continue;
                         }
+                        const device = devices[deviceId];
+                        const structureId = device.structure_id;
+                        if (this.optionSet(disableFlags[DeviceType.deviceType], device.serial_number, deviceId)) {
+                            this.excludedUUIDs.add(uuid);
+                            continue;
+                        }
+                        if (this.config.structureId && this.config.structureId !== structureId) {
+                            this.log('Skipping device ' + deviceId + ' because it is not in the required structure. Has ' + structureId + ', looking for ' + this.config.structureId + '.');
+                            this.excludedUUIDs.add(uuid);
+                            continue;
+                        }
+                        const accessory = new DeviceType(this.conn, this.log, device, data.structures[structureId], this);
+                        accessory.removeUnclaimedServices();
+                        this.accessoryLookup[deviceId] = accessory;
+                        mounted.push(accessory);
                     }
-                }.bind(this);
+                }
+                return mounted;
+            }.bind(this);
 
-                loadDevices(ThermostatAccessory);
-                loadDevices(HomeAwayAccessory);
-                loadDevices(TempSensorAccessory);
-                loadDevices(ProtectAccessory);
-                loadDevices(LockAccessory);
-                this.conn.accessories = this.accessoryLookup;
-
-                return foundAccessories;
+            const publishMounted = function(mounted) {
+                const isNew = el => !this.cachedAccessories.includes(el.accessory);
+                const newAccessories = mounted.filter(isNew).map(el => el.accessory);
+                const reusedAccessories = mounted.filter(el => !isNew(el)).map(el => el.accessory);
+                if (newAccessories.length > 0) {
+                    this.api.registerPlatformAccessories('homebridge-nest', 'Nest', newAccessories);
+                }
+                if (reusedAccessories.length > 0) {
+                    this.api.updatePlatformAccessories(reusedAccessories);
+                }
             }.bind(this);
 
             const updateAccessories = function(data, accList) {
@@ -85,25 +99,40 @@ class NestPlatform {
                 });
             };
 
+            let startupComplete = false;
             const handleUpdates = function(data) {
-                if (Object.keys(this.accessoryLookup).length > 0) {
-                    updateAccessories(data, this.accessoryLookup);
+                if (!startupComplete) {
+                    return;
                 }
+                const mounted = mountNewDevices(data);
+                if (mounted.length > 0) {
+                    mounted.forEach(el => this.log('Nest device "' + el.name + '" is now available.'));
+                    publishMounted(mounted);
+                }
+                updateAccessories(data, Object.values(this.accessoryLookup));
             }.bind(this);
 
             try {
                 this.conn = await this.setupConnection(this.optionSet('Debug.Verbose'), this.optionSet('Nest.FieldTest.Enable'));
+                this.conn.accessories = this.accessoryLookup;
                 await this.conn.subscribe(handleUpdates);
                 await this.conn.observe(handleUpdates);
 
                 let initialState = this.conn.apiResponseToObjectTree(this.conn.currentState);
-                this.accessoryLookup = generateAccessories(initialState);
+                publishMounted(mountNewDevices(initialState));
+                startupComplete = true;
 
-                this.api.unregisterPlatformAccessories('homebridge-nest', 'Nest', this.cachedAccessories);
-                this.cachedAccessories = [];
-                this.api.registerPlatformAccessories('homebridge-nest', 'Nest', this.accessoryLookup.map(el => el.accessory));
+                const excludedAccessories = this.cachedAccessories.filter(accessory => this.excludedUUIDs.has(accessory.UUID));
+                if (excludedAccessories.length > 0) {
+                    this.api.unregisterPlatformAccessories('homebridge-nest', 'Nest', excludedAccessories);
+                }
 
-                let accessoriesMounted = this.accessoryLookup.map(el => el.constructor.name);
+                // Kept rather than removed, so HomeKit keeps their rooms and automations. They come back when Nest reports them.
+                const missingAccessories = this.unclaimedCachedAccessories().filter(accessory => !this.excludedUUIDs.has(accessory.UUID));
+                missingAccessories.forEach(accessory => this.log.warn('Nest did not report "' + accessory.displayName + '" at startup. It will show as not responding until Nest reports it.'));
+                this.markUnavailable(missingAccessories);
+
+                let accessoriesMounted = Object.values(this.accessoryLookup).map(el => el.constructor.name);
 
                 if (this.config.readyCallback) {
                     axios.post(this.config.readyCallback, {
@@ -116,21 +145,51 @@ class NestPlatform {
             } catch(err) {
                 this.log.error(err);
                 this.log.error('NOTE: Because we couldn\'t connect to the Nest service, your Nest devices in HomeKit will not be responsive.');
-                this.cachedAccessories.forEach(accessory => {
-                    accessory.services.forEach(service => {
-                        service.characteristics.forEach(characteristic => {
-                            characteristic.on('get', callback => callback('error'));
-                            characteristic.on('set', (value, callback) => callback('error'));
-                            characteristic.value;
-                        });
-                    });
-                });
+                this.markUnavailable(this.unclaimedCachedAccessories());
             }
         });
     }
 
     configureAccessory(accessory) {
         this.cachedAccessories.push(accessory);
+    }
+
+    accessoryUUID(DeviceType, deviceId) {
+        return this.api.hap.uuid.generate('nest' + '.' + DeviceType.deviceType + '.' + deviceId);
+    }
+
+    claimCachedAccessory(uuid) {
+        const accessory = this.cachedAccessories.find(el => el.UUID === uuid);
+        if (accessory) {
+            this.claimedUUIDs.add(uuid);
+            this.clearUnavailable(accessory);
+        }
+        return accessory;
+    }
+
+    unclaimedCachedAccessories() {
+        return this.cachedAccessories.filter(accessory => !this.claimedUUIDs.has(accessory.UUID));
+    }
+
+    markUnavailable(accessories) {
+        accessories.forEach(accessory => {
+            accessory.services.forEach(service => {
+                service.characteristics.forEach(characteristic => {
+                    characteristic.on('get', callback => callback('error'));
+                    characteristic.on('set', (value, callback) => callback('error'));
+                    characteristic.value;
+                });
+            });
+        });
+    }
+
+    clearUnavailable(accessory) {
+        accessory.services.forEach(service => {
+            service.characteristics.forEach(characteristic => {
+                characteristic.removeAllListeners('get');
+                characteristic.removeAllListeners('set');
+            });
+        });
     }
 
     optionSet(key, serialNumber, deviceId) {
@@ -165,8 +224,7 @@ module.exports = function(homebridge) {
         Accessory: homebridge.platformAccessory,
         Service: homebridge.hap.Service,
         Characteristic: homebridge.hap.Characteristic,
-        hap: homebridge.hap,
-        uuid: homebridge.hap.uuid
+        hap: homebridge.hap
     };
 
     require('./lib/nest-device-accessory')(exportedTypes);
